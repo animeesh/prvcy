@@ -1,83 +1,73 @@
-import SwiftUI
 import AppKit
+import SwiftUI
 
 struct ContentView: View {
     private enum ActiveSheet: String, Identifiable {
-        case create
-        case unlock
-        case lock
+        case setPIN
+        case openFolder
 
         var id: String { rawValue }
     }
 
-    @State private var sourceFolder: URL?
-    @State private var vaultURL: URL?
-    @State private var selectedVaultURL: URL?
-    @State private var mountedVaults: [MountedVault] = []
+    @State private var selectedFolder: URL?
     @State private var activeSheet: ActiveSheet?
     @State private var isAlertPresented = false
     @State private var alertTitle = ""
     @State private var alertMessage = ""
+    @State private var isChangingPIN = false
 
     var body: some View {
         VStack(alignment: .leading, spacing: 18) {
-            Label("Password Protect", systemImage: "lock.shield")
+            Label("Password Protect", systemImage: "folder.badge.questionmark")
                 .font(.largeTitle)
                 .fontWeight(.semibold)
 
-            Text("Create and manage encrypted sparsebundle vaults stored locally on this Mac.")
+            Text("Choose a folder, enter its PIN, and open it in Finder.")
                 .foregroundStyle(.secondary)
 
+            Label {
+                Text("Convenience only: this PIN does not secure the folder. Finder and other apps can still open it directly.")
+            } icon: {
+                Image(systemName: "exclamationmark.triangle.fill")
+            }
+            .font(.callout)
+            .foregroundStyle(.orange)
+            .fixedSize(horizontal: false, vertical: true)
+
             VStack(spacing: 10) {
-                Button("Protect a Folder", systemImage: "folder.badge.lock") {
-                    selectFolderAndVaultLocation()
+                Button("Set or Change Folder PIN", systemImage: "key") {
+                    selectFolderForSettingPIN()
                 }
 
-                Button("Unlock a Vault", systemImage: "lock.open") {
-                    selectVaultToUnlock()
-                }
-
-                Button("Lock Vault", systemImage: "lock") {
-                    findMountedVaults()
+                Button("Enter PIN and Open Folder", systemImage: "lock.open") {
+                    selectFolderToOpen()
                 }
             }
             .buttonStyle(.borderedProminent)
             .controlSize(.large)
             .frame(maxWidth: .infinity)
 
-            Text("Files remain accessible while a vault is mounted. Locking unmounts it.")
-                .font(.footnote)
-                .foregroundStyle(.tertiary)
-
             Button("Help / About", systemImage: "info.circle") {
-                presentAlert(
-                    title: "About Password Protect",
-                    message: "Vaults use AES-256 encrypted macOS disk images. Files are accessible while mounted. The original folder is never removed."
-                )
+                NSApp.orderFrontStandardAboutPanel(nil)
             }
             .buttonStyle(.link)
             .frame(maxWidth: .infinity)
         }
         .padding(28)
-        .frame(width: 420)
+        .frame(width: 440)
         .sheet(item: $activeSheet) { sheet in
             switch sheet {
-            case .create:
-                PasswordPromptView(
-                    title: "Set a Vault Password",
-                    confirmationRequired: true,
-                    actionTitle: "Create Encrypted Vault",
-                    onSubmit: createVault
-                )
-            case .unlock:
-                PasswordPromptView(
-                    title: "Unlock Vault",
-                    confirmationRequired: false,
-                    actionTitle: "Unlock",
-                    onSubmit: unlockVault
-                )
-            case .lock:
-                MountedVaultPickerView(vaults: mountedVaults, onLock: lockVault)
+            case .setPIN:
+                PINPromptView(
+                    title: isChangingPIN ? "Change Folder PIN" : "Set Folder PIN",
+                    isCreating: true
+                ) { pin in
+                    try await setPIN(pin)
+                }
+            case .openFolder:
+                PINPromptView(title: "Enter PIN to Open Folder", isCreating: false) { pin in
+                    try await openFolder(pin: pin)
+                }
             }
         }
         .alert(alertTitle, isPresented: $isAlertPresented) {
@@ -87,129 +77,61 @@ struct ContentView: View {
         }
     }
 
-    private func selectFolderAndVaultLocation() {
-        let folderPanel = NSOpenPanel()
-        folderPanel.canChooseFiles = false
-        folderPanel.canChooseDirectories = true
-        folderPanel.allowsMultipleSelection = false
-        folderPanel.prompt = "Choose Folder"
+    private func selectFolderForSettingPIN() {
+        guard let folder = selectFolder(prompt: "Choose Folder") else { return }
+        selectedFolder = folder
+        isChangingPIN = FolderPINService().hasPIN(for: folder)
+        activeSheet = .setPIN
+    }
 
-        guard folderPanel.runModal() == .OK, let folder = folderPanel.url else {
-            return
-        }
+    private func selectFolderToOpen() {
+        guard let folder = selectFolder(prompt: "Choose Folder to Open") else { return }
+        selectedFolder = folder
 
-        let savePanel = NSSavePanel()
-        savePanel.nameFieldStringValue = "\(folder.lastPathComponent).sparsebundle"
-        savePanel.canCreateDirectories = true
-        savePanel.isExtensionHidden = false
-        savePanel.prompt = "Choose Vault Location"
-
-        guard savePanel.runModal() == .OK, let destination = savePanel.url else {
-            return
-        }
-
-        let vaultDestination = destination.pathExtension.lowercased() == "sparsebundle"
-            ? destination
-            : destination.appendingPathExtension("sparsebundle")
-
-        guard !FileManager.default.fileExists(atPath: vaultDestination.path) else {
+        guard FolderPINService().hasPIN(for: folder) else {
             presentAlert(
-                title: "Vault Already Exists",
-                message: "Choose a different destination. Existing vaults are never overwritten."
+                title: "No PIN Set",
+                message: "Set a PIN for this folder first. Note that Finder can still open it without this app."
             )
             return
         }
 
-        sourceFolder = folder
-        vaultURL = vaultDestination
-        activeSheet = .create
+        activeSheet = .openFolder
     }
 
-    private func createVault(password: Data) async throws {
-        guard let sourceFolder, let vaultURL else {
-            throw DiskImageError.invalidSelection
-        }
-
-        try await Task.detached(priority: .userInitiated) {
-            try DiskImageService().createVault(
-                from: sourceFolder,
-                at: vaultURL,
-                password: password
-            )
-        }.value
-
-        activeSheet = nil
-        presentAlert(
-            title: "Vault Created",
-            message: "The encrypted vault was created at \(vaultURL.path). The original folder was not changed."
-        )
-    }
-
-    private func selectVaultToUnlock() {
+    private func selectFolder(prompt: String) -> URL? {
         let panel = NSOpenPanel()
-        panel.canChooseFiles = true
+        panel.canChooseFiles = false
         panel.canChooseDirectories = true
         panel.allowsMultipleSelection = false
-        panel.prompt = "Unlock Vault"
-
-        guard panel.runModal() == .OK, let imageURL = panel.url else {
-            return
-        }
-
-        selectedVaultURL = imageURL
-        activeSheet = .unlock
+        panel.prompt = prompt
+        return panel.runModal() == .OK ? panel.url : nil
     }
 
-    private func unlockVault(password: Data) async throws {
-        guard let selectedVaultURL else {
-            throw DiskImageError.invalidSelection
+    private func setPIN(_ pin: Data) async throws {
+        guard let selectedFolder else {
+            throw FolderPINError.couldNotSavePIN
         }
 
-        let mountedVault = try await Task.detached(priority: .userInitiated) {
-            try DiskImageService().unlockVault(at: selectedVaultURL, password: password)
-        }.value
-
+        try FolderPINService().setPIN(pin, for: selectedFolder)
         activeSheet = nil
-        NSWorkspace.shared.activateFileViewerSelecting([mountedVault.mountPoint])
-        presentAlert(
-            title: "Vault Unlocked",
-            message: "The vault is mounted at \(mountedVault.mountPoint.path). Its files remain accessible until it is locked."
-        )
+        openFolderInFinder(selectedFolder)
     }
 
-    private func findMountedVaults() {
-        Task {
-            do {
-                let vaults = try await Task.detached(priority: .userInitiated) {
-                    try DiskImageService().mountedVaults()
-                }.value
-
-                guard !vaults.isEmpty else {
-                    presentAlert(
-                        title: "No Mounted Vaults",
-                        message: "There are no mounted vaults to lock. The vault may already be locked; unlock one first."
-                    )
-                    return
-                }
-
-                mountedVaults = vaults
-                activeSheet = .lock
-            } catch {
-                presentAlert(title: "Unable to Find Vaults", message: error.localizedDescription)
-            }
+    private func openFolder(pin: Data) async throws {
+        guard let selectedFolder else {
+            throw FolderPINError.pinNotSet
         }
+
+        try FolderPINService().verifyPIN(pin, for: selectedFolder)
+        activeSheet = nil
+        openFolderInFinder(selectedFolder)
     }
 
-    private func lockVault(_ vault: MountedVault) async throws {
-        try await Task.detached(priority: .userInitiated) {
-            try DiskImageService().lockVault(vault)
-        }.value
-
-        activeSheet = nil
-        presentAlert(
-            title: "Vault Locked",
-            message: "macOS successfully unmounted the vault."
-        )
+    private func openFolderInFinder(_ folderURL: URL) {
+        DispatchQueue.main.asyncAfter(deadline: .now() + 0.25) {
+            NSWorkspace.shared.open(folderURL)
+        }
     }
 
     private func presentAlert(title: String, message: String) {
