@@ -30,7 +30,7 @@ process to return to the shell.
 The app creates AES-256-encrypted sparsebundle images, never deletes the
 selected source folder, and does not save passwords. Passwords are passed to
 macOS through standard input. The creation workflow also attempts to mount and
-eject the new image before reporting success.
+eject the new image before reporting success. POC
 
 This macOS version marks the `hdiutil` create, attach, and detach verbs as
 deprecated. The app uses the documented `diskutil image` equivalents for
